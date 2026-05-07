@@ -1,0 +1,13 @@
+# --- export-time dependencies (run on any machine with PyTorch) ---
+torch>=2.3.0
+transformers>=4.40.0
+onnx>=1.16.0
+onnxruntime>=1.18.0   # CPU-only, for post-export graph validation
+
+# --- inference-time dependencies (Windows Ryzen AI machine) ---
+# Run `pip install -r requirements.txt` BEFORE installing the Ryzen AI SDK.
+# The SDK overwrites the PyPI onnxruntime with its own build (VitisAI EP).
+# Running pip install *after* the SDK re-installs the vanilla version and
+# breaks NPU support.
+numpy>=1.24.0
+opencv-python>=4.9.0

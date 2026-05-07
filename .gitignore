@@ -1,0 +1,19 @@
+# ONNX model files — too large for git
+models/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# HuggingFace model cache
+*.bin
+*.safetensors
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
