@@ -1,9 +1,11 @@
 """
 Live face-touching detection on the Ryzen AI NPU.
 
-The FP32 encoder runs on the NPU: the VitisAI EP compiles float models to
-BF16 with its VAIML compiler (~5 min on first launch, then cached). The
-zero-shot head runs in FP32 numpy on the CPU.
+Each frame is classified as "no face detected", "not touching face" or
+"touching face". YuNet (CPU) checks for a face first; only then does the
+SigLIP encoder run on the NPU — the VitisAI EP compiles the FP32 model to
+BF16 (~5 min on first launch, then cached) — followed by the zero-shot head
+in FP32 numpy.
 
 Usage:
   python inference.py      # press 'q' in the preview window to quit
@@ -20,6 +22,14 @@ import onnxruntime as ort
 ONNX_PATH = Path("models/face_touch_siglip_fp32.onnx")
 HEAD_PATH = Path("models/face_touch_head.npz")
 NPU_CACHE_DIR = Path("models/npu_cache")
+FACE_MODEL_PATH = Path("models/face_detection_yunet.onnx")
+
+# YuNet scores your face ≥0.84 even with a hand over it, and leftover
+# background ≤0.18 with the face masked out.
+FACE_SCORE_THRESHOLD = 0.6
+
+NO_FACE, NOT_TOUCHING, TOUCHING = "no face detected", "not touching face", "touching face"
+COLORS = {NO_FACE: (160, 160, 160), NOT_TOUCHING: (0, 255, 0), TOUCHING: (0, 0, 255)}   # BGR
 
 IMAGE_SIZE = 224
 TARGET_FPS = 1      # inference rate; the preview runs at camera rate
@@ -66,6 +76,20 @@ class ZeroShotHead:
         return float(1 / (1 + np.exp(-self.logit_scale * (self.margin(image_embeds) - self.threshold))))
 
 
+class FaceDetector:
+    """YuNet face detector (OpenCV, CPU, ~17 ms per 640x480 frame)."""
+
+    def __init__(self, path: Path = FACE_MODEL_PATH):
+        if not path.exists():
+            sys.exit(f"Face detector not found: {path} — run export_model.py first.")
+        self.detector = cv2.FaceDetectorYN.create(str(path), "", (0, 0), FACE_SCORE_THRESHOLD)
+
+    def __call__(self, frame: np.ndarray) -> bool:
+        """Whether the frame contains a face."""
+        self.detector.setInputSize((frame.shape[1], frame.shape[0]))
+        return self.detector.detect(frame)[1] is not None
+
+
 def preprocess(frame: np.ndarray) -> np.ndarray:
     """BGR uint8 frame → [1, 3, 224, 224] float32 in [-1, 1] (SigLIP normalization)."""
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -89,9 +113,10 @@ def main() -> None:
     head = ZeroShotHead()
     if not head.calibrated:
         print("WARNING: head is not calibrated — run calibrate_head.py.")
+    has_face = FaceDetector()
     cap = open_camera()
 
-    touching, conf, last_infer = False, 0.0, 0.0
+    status, text, last_infer = NO_FACE, NO_FACE, 0.0
     print("Running — press 'q' to quit.")
     while True:
         ret, frame = cap.read()
@@ -102,14 +127,16 @@ def main() -> None:
         now = time.monotonic()
         if now - last_infer >= 1 / TARGET_FPS:
             last_infer = now
-            embeds = session.run(None, {"pixel_values": preprocess(frame)})[0][0]
-            p_touch = head(embeds)
-            touching, conf = p_touch > 0.5, max(p_touch, 1 - p_touch)
-            print(f"{'touching' if touching else 'not touching'}  (p_touch={p_touch:.3f})")
+            if has_face(frame):
+                embeds = session.run(None, {"pixel_values": preprocess(frame)})[0][0]
+                p_touch = head(embeds)
+                status = TOUCHING if p_touch > 0.5 else NOT_TOUCHING
+                text = f"{status} ({max(p_touch, 1 - p_touch):.2f})"
+            else:
+                status = text = NO_FACE
+            print(text)
 
-        label = "touching face" if touching else "not touching face"
-        color = (0, 0, 255) if touching else (0, 255, 0)
-        cv2.putText(frame, f"{label} ({conf:.2f})", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+        cv2.putText(frame, text, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, COLORS[status], 2)
         cv2.imshow("Face Touching Detection", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break

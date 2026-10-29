@@ -1,8 +1,10 @@
 """
-Export the SigLIP vision encoder to FP32 ONNX and save the zero-shot head.
+Export the SigLIP vision encoder to FP32 ONNX, save the zero-shot head, and
+download the YuNet face detector.
 
   models/face_touch_siglip_fp32.onnx  pixel_values [1, 3, 224, 224] → image_embeds [1, 768]
   models/face_touch_head.npz          L2-normalized text embeddings + logit_scale
+  models/face_detection_yunet.onnx    OpenCV YuNet face detector
 
 The head (normalize + dot product with the text embeddings) stays out of the
 graph: the decision hinges on a ~0.01 gap between two cosine similarities,
@@ -12,6 +14,7 @@ Usage:
   python export_model.py
 """
 
+import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +30,9 @@ PROMPTS = [
 ]
 ONNX_PATH = Path("models/face_touch_siglip_fp32.onnx")
 HEAD_PATH = Path("models/face_touch_head.npz")
+FACE_MODEL_PATH = Path("models/face_detection_yunet.onnx")
+FACE_MODEL_URL = ("https://github.com/opencv/opencv_zoo/raw/main/models/"
+                  "face_detection_yunet/face_detection_yunet_2023mar.onnx")
 
 
 class VisionEncoder(torch.nn.Module):
@@ -82,7 +88,12 @@ def main() -> None:
     sess = ort.InferenceSession(str(ONNX_PATH), providers=["CPUExecutionProvider"])
     actual = sess.run(None, {"pixel_values": dummy.numpy()})[0]
     np.testing.assert_allclose(actual, expected, atol=1e-3, rtol=1e-3)
-    print("ONNX graph valid and matches PyTorch. Next: python calibrate_head.py")
+    print("ONNX graph valid and matches PyTorch.")
+
+    if not FACE_MODEL_PATH.exists():
+        urllib.request.urlretrieve(FACE_MODEL_URL, FACE_MODEL_PATH)
+        print(f"Downloaded face detector to {FACE_MODEL_PATH}")
+    print("Next: python calibrate_head.py")
 
 
 if __name__ == "__main__":
