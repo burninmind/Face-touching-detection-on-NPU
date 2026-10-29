@@ -1,16 +1,18 @@
-# ONNX model files — too large for git
+# Exported models and NPU compile cache — too large for git
 models/
 
-# Python cache
+# Webcam calibration frames — contain your face
+calibration_frames/
+
+# Written to the working directory by the VitisAI EP on each NPU compile
+original-*-signature.txt
+
+# Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+.venv/
 
-# HuggingFace model cache
-*.bin
-*.safetensors
-
-# OS artifacts
+# OS
 .DS_Store
 Thumbs.db
 

@@ -1,13 +1,11 @@
-# --- export-time dependencies (run on any machine with PyTorch) ---
+# Export (export_model.py) — any env with PyTorch.
+# Do NOT install these into the Ryzen AI env: PyPI onnxruntime would replace the
+# SDK's build and remove the VitisAI Execution Provider (no NPU).
 torch>=2.3.0
 transformers>=4.40.0
 onnx>=1.16.0
-onnxruntime>=1.18.0   # CPU-only, for post-export graph validation
+onnxruntime>=1.18.0
 
-# --- inference-time dependencies (Windows Ryzen AI machine) ---
-# Run `pip install -r requirements.txt` BEFORE installing the Ryzen AI SDK.
-# The SDK overwrites the PyPI onnxruntime with its own build (VitisAI EP).
-# Running pip install *after* the SDK re-installs the vanilla version and
-# breaks NPU support.
+# Calibration and inference (calibrate_head.py, inference.py) — Ryzen AI env.
 numpy>=1.24.0
 opencv-python>=4.9.0

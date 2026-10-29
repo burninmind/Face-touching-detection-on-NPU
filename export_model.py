@@ -1,148 +1,88 @@
 """
-One-time script: exports google/siglip-base-patch16-224 to ONNX at BF16 precision.
+Export the SigLIP vision encoder to FP32 ONNX and save the zero-shot head.
 
-The exported model:
-  - Input:  pixel_values  [batch, 3, 224, 224]  float32
-  - Output: probabilities [batch, 2]             float32  (sigmoid scores)
-  - Classes (index 0 / 1): "not touching face" / "touching face"
+  models/face_touch_siglip_fp32.onnx  pixel_values [1, 3, 224, 224] → image_embeds [1, 768]
+  models/face_touch_head.npz          L2-normalized text embeddings + logit_scale
 
-Text embeddings for both classes are baked as constants in the graph,
-so no text pipeline is needed at inference time.
+The head (normalize + dot product with the text embeddings) stays out of the
+graph: the decision hinges on a ~0.01 gap between two cosine similarities,
+too fine for reduced precision. inference.py evaluates it in FP32 numpy.
 
-Run once, then copy models/face_touch_siglip_bf16.onnx to the Windows machine.
+Usage:
+  python export_model.py
 """
 
-import torch
-import torch.nn as nn
+from pathlib import Path
+
 import numpy as np
 import onnx
 import onnxruntime as ort
-from pathlib import Path
-from transformers import SiglipModel, SiglipProcessor
+import torch
+from transformers import SiglipModel, SiglipTokenizer
 
 MODEL_ID = "google/siglip-base-patch16-224"
-CLASSES = ["not touching face", "touching face"]
-OUTPUT_DIR = Path("models")
-ONNX_PATH = OUTPUT_DIR / "face_touch_siglip_bf16.onnx"
-OPSET = 17
+PROMPTS = [
+    "a photo of a person not touching their face",
+    "a photo of a person touching their face with their hand",
+]
+ONNX_PATH = Path("models/face_touch_siglip_fp32.onnx")
+HEAD_PATH = Path("models/face_touch_head.npz")
 
 
-class SigLIPFaceTouchClassifier(nn.Module):
-    """
-    Vision-only wrapper around SigLIP for two-class zero-shot classification.
+class VisionEncoder(torch.nn.Module):
+    """Returns SigLIP's image embedding (the pooler output) as a single tensor."""
 
-    Accepts FP32 pixel values, casts internally to BF16 for NPU-friendly
-    computation, then returns FP32 sigmoid probabilities.  Text embeddings
-    and the logit scale/bias are baked as buffers (ONNX initializer constants).
-    """
-
-    def __init__(
-        self,
-        vision_model: nn.Module,
-        visual_projection: nn.Module,
-        text_embeds_bf16: torch.Tensor,
-        logit_scale: float,
-        logit_bias: float,
-    ):
+    def __init__(self, vision_model: torch.nn.Module):
         super().__init__()
         self.vision_model = vision_model
-        self.visual_projection = visual_projection
-        self.register_buffer("text_embeds", text_embeds_bf16)                        # [2, 768]
-        self.register_buffer("logit_scale", torch.tensor(logit_scale, dtype=torch.bfloat16))
-        self.register_buffer("logit_bias",  torch.tensor(logit_bias,  dtype=torch.bfloat16))
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        # Cast FP32 input to BF16 — the Cast node appears in the ONNX graph,
-        # keeping the external interface FP32 (numpy-compatible).
-        x = pixel_values.to(torch.bfloat16)
-
-        vision_out = self.vision_model(pixel_values=x)
-        img_feat = self.visual_projection(vision_out.pooler_output)       # [B, 768] BF16
-        img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)         # L2 normalize
-
-        # SigLIP zero-shot: cosine-sim scaled by logit_scale + logit_bias, then sigmoid
-        logits = img_feat @ self.text_embeds.T                             # [B, 2] BF16
-        logits = logits * self.logit_scale + self.logit_bias
-
-        return torch.sigmoid(logits).to(torch.float32)                    # [B, 2] FP32
+        return self.vision_model(pixel_values=pixel_values).pooler_output
 
 
 def main() -> None:
     print(f"Loading {MODEL_ID} …")
-    model = SiglipModel.from_pretrained(MODEL_ID, torch_dtype=torch.float32)
-    processor = SiglipProcessor.from_pretrained(MODEL_ID)
-    model.eval()
+    # Eager attention exports as plain MatMul/Softmax; the SDPA path crashes the
+    # legacy TorchScript exporter in older torch builds (e.g. the ryzen-ai env).
+    model = SiglipModel.from_pretrained(MODEL_ID, attn_implementation="eager").eval()
+    tokenizer = SiglipTokenizer.from_pretrained(MODEL_ID)
 
-    # --- Precompute text embeddings in FP32 then bake as BF16 ---
-    print("Computing text embeddings …")
-    text_inputs = processor(
-        text=CLASSES,
-        return_tensors="pt",
-        padding="max_length",   # SigLIP requires fixed-length input sequences
-    )
+    # SigLIP requires fixed-length (max_length) text inputs
+    text_inputs = tokenizer(PROMPTS, return_tensors="pt", padding="max_length")
     with torch.no_grad():
-        # get_text_features() does NOT apply L2 normalization — must do it here
-        text_features = model.get_text_features(**text_inputs)            # [2, 768] FP32
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-    text_features_bf16 = text_features.to(torch.bfloat16)
-    print(f"  text_embeds shape: {text_features_bf16.shape}")
+        text_embeds = model.get_text_features(**text_inputs)
+        if not isinstance(text_embeds, torch.Tensor):   # newer transformers return an output object
+            text_embeds = text_embeds.pooler_output
+    text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
 
-    # logit_scale is stored as its log; exp() gives the actual scale multiplier
-    logit_scale = model.logit_scale.exp().item()
-    logit_bias  = model.logit_bias.item()
-    print(f"  logit_scale={logit_scale:.4f}, logit_bias={logit_bias:.4f}")
-
-    # --- Build wrapper with BF16 vision backbone ---
-    wrapper = SigLIPFaceTouchClassifier(
-        vision_model=model.vision_model.to(torch.bfloat16).eval(),
-        visual_projection=model.visual_projection.to(torch.bfloat16).eval(),
-        text_embeds_bf16=text_features_bf16,
-        logit_scale=logit_scale,
-        logit_bias=logit_bias,
+    ONNX_PATH.parent.mkdir(exist_ok=True)
+    np.savez(
+        HEAD_PATH,
+        text_embeds=text_embeds.numpy().astype(np.float32),
+        logit_scale=np.float32(model.logit_scale.exp().item()),   # stored as log; ~117
     )
+    print(f"Saved head to {HEAD_PATH}")
 
-    # --- Dry-run to catch shape or dtype issues before export ---
-    dummy = torch.randn(1, 3, 224, 224, dtype=torch.float32)
-    with torch.no_grad():
-        pytorch_out = wrapper(dummy)
-    assert pytorch_out.shape == (1, 2), f"Expected (1,2), got {pytorch_out.shape}"
-    assert pytorch_out.dtype == torch.float32, f"Expected float32, got {pytorch_out.dtype}"
-    assert torch.all((pytorch_out >= 0) & (pytorch_out <= 1)), "sigmoid outputs must be in [0,1]"
-    print(f"Dry-run OK — class probs: {pytorch_out.squeeze().tolist()}")
-
-    # --- ONNX export ---
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    print(f"Exporting to {ONNX_PATH} (opset {OPSET}) …")
+    # Static batch of 1: the NPU compiler does not support dynamic shapes.
+    encoder = VisionEncoder(model.vision_model).eval()
+    dummy = torch.randn(1, 3, 224, 224)
+    print(f"Exporting {ONNX_PATH} …")
     torch.onnx.export(
-        wrapper,
+        encoder,
         dummy,
         str(ONNX_PATH),
-        opset_version=OPSET,        # 17 required for first-class LayerNormalization
+        opset_version=17,   # first-class LayerNormalization
         input_names=["pixel_values"],
-        output_names=["probabilities"],
-        dynamic_axes={
-            "pixel_values":  {0: "batch"},
-            "probabilities": {0: "batch"},
-        },
-        do_constant_folding=True,   # folds logit_scale/bias and text_embeds constants
+        output_names=["image_embeds"],
     )
-    print("Export done.")
 
-    # --- ONNX graph validation ---
-    print("Validating ONNX graph …")
-    model_onnx = onnx.load(str(ONNX_PATH))
-    onnx.checker.check_model(model_onnx)
-    print("  ONNX checker: OK")
-
-    # Numerical sanity-check against PyTorch reference (CPU EP)
+    onnx.checker.check_model(str(ONNX_PATH))
+    with torch.no_grad():
+        expected = encoder(dummy).numpy()
     sess = ort.InferenceSession(str(ONNX_PATH), providers=["CPUExecutionProvider"])
-    ort_out = sess.run(["probabilities"], {"pixel_values": dummy.numpy()})[0]
-    np.testing.assert_allclose(ort_out, pytorch_out.numpy(), atol=1e-2)
-    # atol=1e-2 is appropriate: BF16 has 7-bit mantissa (~0.5% relative error)
-    print("  Numerical match within BF16 tolerance: OK")
-
-    print(f"\nAll done. Model saved to: {ONNX_PATH.resolve()}")
-    print("Copy this file to the Windows Ryzen AI machine, then run inference.py.")
+    actual = sess.run(None, {"pixel_values": dummy.numpy()})[0]
+    np.testing.assert_allclose(actual, expected, atol=1e-3, rtol=1e-3)
+    print("ONNX graph valid and matches PyTorch. Next: python calibrate_head.py")
 
 
 if __name__ == "__main__":

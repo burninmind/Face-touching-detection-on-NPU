@@ -1,16 +1,12 @@
 """
-Face-touching detection — Windows-native inference on Ryzen AI NPU.
+Live face-touching detection on the Ryzen AI NPU.
 
-Prerequisites (Windows machine):
-  1. Install Ryzen AI SDK 1.7.1 from AMD (provides VitisAI EP + xclbin + vaip_config.json)
-  2. pip install numpy opencv-python
-     Do NOT pip install onnxruntime — the SDK already installed it with the VitisAI EP.
-  3. Copy models/face_touch_siglip_bf16.onnx here (produced by export_model.py).
+The FP32 encoder runs on the NPU: the VitisAI EP compiles float models to
+BF16 with its VAIML compiler (~5 min on first launch, then cached). The
+zero-shot head runs in FP32 numpy on the CPU.
 
 Usage:
-  python inference.py
-
-Press 'q' in the preview window to quit.
+  python inference.py      # press 'q' in the preview window to quit
 """
 
 import sys
@@ -21,135 +17,100 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-ONNX_PATH = Path("models/face_touch_siglip_bf16.onnx")
-
-# Default vaip_config.json location after Ryzen AI SDK 1.7.1 installation on Windows.
-# Adjust if your SDK is installed elsewhere.
-VAIP_CONFIG = Path(r"C:\Program Files\RyzenAI\1.7.1\voe-4.0-win_amd64\vaip_config.json")
-
-CLASSES = ["not touching face", "touching face"]
-
-# SigLIP base-patch16-224 normalization: (pixel/255 - 0.5) / 0.5  →  [-1, 1]
-MEAN = np.array([0.5, 0.5, 0.5], dtype=np.float32)
-STD  = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+ONNX_PATH = Path("models/face_touch_siglip_fp32.onnx")
+HEAD_PATH = Path("models/face_touch_head.npz")
+NPU_CACHE_DIR = Path("models/npu_cache")
 
 IMAGE_SIZE = 224
-TARGET_FPS = 1          # inference rate (preview window stays at camera FPS)
-CAMERA_INDEX = 0        # change if the laptop has multiple cameras
+TARGET_FPS = 1      # inference rate; the preview runs at camera rate
+CAMERA_INDEX = 0
 
-
-# ---------------------------------------------------------------------------
-# ONNX Runtime session
-# ---------------------------------------------------------------------------
 
 def create_session() -> ort.InferenceSession:
+    """Encoder session on the NPU, falling back to CPU without the Ryzen AI SDK."""
     if not ONNX_PATH.exists():
-        sys.exit(
-            f"Model not found: {ONNX_PATH}\n"
-            "Run export_model.py first, then copy the .onnx file here."
-        )
+        sys.exit(f"Model not found: {ONNX_PATH} — run export_model.py first.")
 
-    providers: list = []
-    if VAIP_CONFIG.exists():
-        # VitisAI EP config path must be a plain str — Path objects are not accepted
-        # by some SDK versions.
-        providers.append(("VitisAIExecutionProvider", {"config_file": str(VAIP_CONFIG)}))
-        print(f"VitisAI EP enabled — config: {VAIP_CONFIG}")
-        print("First run triggers NPU graph compilation (30–90 s). Subsequent runs use cache.")
+    providers: list = ["CPUExecutionProvider"]
+    if "VitisAIExecutionProvider" in ort.get_available_providers():
+        # Cache key tracks the model file, so a re-export forces a recompile.
+        stat = ONNX_PATH.stat()
+        providers.insert(0, ("VitisAIExecutionProvider", {
+            "cache_dir": str(NPU_CACHE_DIR.resolve()),
+            "cache_key": f"{ONNX_PATH.stem}_{stat.st_size}_{int(stat.st_mtime)}",
+        }))
+        print("Using NPU (first launch compiles the model, ~5 min).")
     else:
-        print(
-            f"WARNING: vaip_config.json not found at {VAIP_CONFIG}\n"
-            "Falling back to CPU. Install Ryzen AI SDK 1.7.1 to enable NPU inference."
-        )
-    providers.append("CPUExecutionProvider")
-
-    opts = ort.SessionOptions()
-    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-
-    session = ort.InferenceSession(str(ONNX_PATH), sess_options=opts, providers=providers)
-    print(f"Active providers: {session.get_providers()}")
-    return session
+        print("WARNING: VitisAIExecutionProvider unavailable — running on CPU. "
+              "Activate the Ryzen AI SDK env for NPU inference.")
+    return ort.InferenceSession(str(ONNX_PATH), providers=providers)
 
 
-# ---------------------------------------------------------------------------
-# Preprocessing
-# ---------------------------------------------------------------------------
+class ZeroShotHead:
+    """SigLIP zero-shot head with a calibrated decision threshold."""
+
+    def __init__(self, path: Path = HEAD_PATH):
+        with np.load(path) as head:
+            self.text_embeds = head["text_embeds"]      # [2, 768]: not touching, touching
+            self.logit_scale = float(head["logit_scale"])
+            self.calibrated = "threshold" in head.files
+            self.threshold = float(head["threshold"]) if self.calibrated else 0.0
+
+    def margin(self, image_embeds: np.ndarray) -> float:
+        """Cosine similarity to the "touching" prompt minus the "not touching" one."""
+        cos = self.text_embeds @ (image_embeds / np.linalg.norm(image_embeds))
+        return float(cos[1] - cos[0])
+
+    def __call__(self, image_embeds: np.ndarray) -> float:
+        """Probability of touching; 0.5 exactly at the threshold."""
+        return float(1 / (1 + np.exp(-self.logit_scale * (self.margin(image_embeds) - self.threshold))))
+
 
 def preprocess(frame: np.ndarray) -> np.ndarray:
-    """Convert a BGR uint8 OpenCV frame to a [1, 3, 224, 224] float32 tensor."""
-    # OpenCV uses BGR; SigLIP expects RGB — conversion is mandatory
+    """BGR uint8 frame → [1, 3, 224, 224] float32 in [-1, 1] (SigLIP normalization)."""
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    resized = cv2.resize(rgb, (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_LINEAR)
-    img = (resized.astype(np.float32) / 255.0 - MEAN) / STD   # → [-1, 1]
-    img = img.transpose(2, 0, 1)                                # HWC → CHW
-    return np.ascontiguousarray(img[np.newaxis])                # [1, 3, 224, 224]
+    img = cv2.resize(rgb, (IMAGE_SIZE, IMAGE_SIZE)).astype(np.float32) / 127.5 - 1.0
+    return np.ascontiguousarray(img.transpose(2, 0, 1)[np.newaxis])
 
 
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
+def open_camera() -> cv2.VideoCapture:
+    # DirectShow avoids Media Foundation's slow startup on some Ryzen laptops
+    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        sys.exit(f"Cannot open camera {CAMERA_INDEX}. "
+                 "Check Settings > Privacy > Camera allows desktop apps.")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    return cap
+
 
 def main() -> None:
     session = create_session()
+    head = ZeroShotHead()
+    if not head.calibrated:
+        print("WARNING: head is not calibrated — run calibrate_head.py.")
+    cap = open_camera()
 
-    # cv2.CAP_DSHOW uses Windows DirectShow backend, which avoids the ~800 ms
-    # Media Foundation initialization delay present on some Ryzen laptops.
-    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        sys.exit(
-            f"Cannot open camera at index {CAMERA_INDEX}.\n"
-            "Check Settings > Privacy > Camera on Windows 11 to allow desktop app access."
-        )
-
-    # Camera runs at its native rate for a smooth preview window;
-    # inference is throttled separately by time.monotonic().
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-
-    label = CLASSES[0]
-    conf  = 0.0
-    last_infer = 0.0
-    infer_interval = 1.0 / TARGET_FPS
-
-    print("Capturing — press 'q' to quit.")
+    touching, conf, last_infer = False, 0.0, 0.0
+    print("Running — press 'q' to quit.")
     while True:
         ret, frame = cap.read()
         if not ret:
-            # Transient grab failure; retry without crashing
             time.sleep(0.05)
             continue
 
         now = time.monotonic()
-        if now - last_infer >= infer_interval:
-            pixel_values = preprocess(frame)
-            probs = session.run(
-                output_names=["probabilities"],
-                input_feed={"pixel_values": pixel_values},
-            )[0][0]                                             # [2] float32
-            idx   = int(np.argmax(probs))
-            label = CLASSES[idx]
-            conf  = float(probs[idx])
+        if now - last_infer >= 1 / TARGET_FPS:
             last_infer = now
-            print(f"[{label}]  confidence={conf:.3f}")
+            embeds = session.run(None, {"pixel_values": preprocess(frame)})[0][0]
+            p_touch = head(embeds)
+            touching, conf = p_touch > 0.5, max(p_touch, 1 - p_touch)
+            print(f"{'touching' if touching else 'not touching'}  (p_touch={p_touch:.3f})")
 
-        # Overlay result on live preview (color-coded: red = touching, green = safe)
-        color = (0, 0, 255) if "touching" in label else (0, 255, 0)
-        cv2.putText(
-            frame,
-            f"{label} ({conf:.2f})",
-            (10, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            color,
-            2,
-        )
+        label = "touching face" if touching else "not touching face"
+        color = (0, 0, 255) if touching else (0, 255, 0)
+        cv2.putText(frame, f"{label} ({conf:.2f})", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
         cv2.imshow("Face Touching Detection", frame)
-
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
